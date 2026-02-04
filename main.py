@@ -118,34 +118,54 @@ class ForgetPlugin(Star):
                 yield event.plain_result("对话历史格式异常，无法操作 ❌")
                 return
 
-            if len(conversation_history) < round_count * 2:
-                yield event.plain_result(f"对话历史不足 {round_count} 轮 ❌")
-                return
+            if not conversation_history:
+                 yield event.plain_result(f"对话历史为空 ❌")
+                 return
             
-            # 查找切割点（倒序查找）
+            # --- 3. 查找切割点 (改良版算法) ---
             split_index = len(conversation_history)
             rounds_found = 0
-            for i in range(len(conversation_history) - 1, 0, -2):
-                # 确保是字典类型
-                msg_curr = conversation_history[i]
-                msg_prev = conversation_history[i-1]
-                
-                if isinstance(msg_curr, dict) and isinstance(msg_prev, dict):
-                    if msg_curr.get("role") == "assistant" and msg_prev.get("role") == "user":
-                        rounds_found += 1
-                        if rounds_found == round_count:
-                            split_index = i - 1
-                            break
+            curr_idx = len(conversation_history) - 1
             
-            if split_index == len(conversation_history):
-                yield event.plain_result(f"只找到了 {rounds_found} 轮可遗忘的对话 ❌")
+            # 倒序遍历寻找需要删除的轮次
+            while rounds_found < round_count and curr_idx >= 0:
+                msg_curr = conversation_history[curr_idx]
+                
+                # 情况A: 遇到 User 消息 (通常是末尾的提问，或者孤立的消息)
+                # 视为 1 轮
+                if msg_curr.get("role") == "user":
+                    split_index = curr_idx
+                    rounds_found += 1
+                    curr_idx -= 1
+                
+                # 情况B: 遇到 Assistant 消息，尝试寻找前一条 User 消息配对
+                elif msg_curr.get("role") == "assistant":
+                    if curr_idx > 0:
+                        msg_prev = conversation_history[curr_idx - 1]
+                        if msg_prev.get("role") == "user":
+                            # 找到完整的 User-Assistant 对，视为 1 轮
+                            split_index = curr_idx - 1
+                            rounds_found += 1
+                            curr_idx -= 2 # 跳过这一对
+                        else:
+                            # 结构异常（Assistant前面不是User），跳过 Assistant 继续向前
+                            curr_idx -= 1
+                    else:
+                        # Assistant 在最开头，跳过
+                        curr_idx -= 1
+                else:
+                    # 其他类型消息 (System等)，跳过
+                    curr_idx -= 1
+            
+            if rounds_found == 0:
+                yield event.plain_result(f"未找到可遗忘的对话 ❌")
                 return
             
             # 切割列表
             new_conversation_history = conversation_history[:split_index]
             deleted_messages = conversation_history[split_index:]
 
-            # --- 3. 存入备份（支持累加） ---
+            # --- 4. 存入备份（支持累加） ---
             async with self.lock:
                 if unified_msg_origin not in self.deleted_conversations:
                     self.deleted_conversations[unified_msg_origin] = {}
@@ -153,9 +173,10 @@ class ForgetPlugin(Star):
                 existing_record = self.deleted_conversations[unified_msg_origin].get(user_id)
                 
                 if existing_record:
-                    # 叠加逻辑：新删除的 + 旧删除的
+                    # 叠加逻辑
                     merged_messages = deleted_messages + existing_record.messages
-                    merged_round_count = round_count + existing_record.round_count
+                    # 注意：这里使用实际找到的 rounds_found 进行累加
+                    merged_round_count = rounds_found + existing_record.round_count
                     
                     self.deleted_conversations[unified_msg_origin][user_id] = DeletedRecord(
                         messages=merged_messages,
@@ -170,11 +191,10 @@ class ForgetPlugin(Star):
                         messages=deleted_messages,
                         conversation_id=conversation.cid,
                         timestamp=datetime.now(),
-                        round_count=round_count
+                        round_count=rounds_found
                     )
 
-            # --- 4. 关键修复：直接传入列表 (List) ---
-            # 移除了 json.dumps，防止双重序列化
+            # --- 5. 关键修复：直接传入列表 (List) ---
             await conv_mgr.update_conversation(
                 unified_msg_origin, conversation.cid, 
                 history=new_conversation_history
@@ -182,7 +202,7 @@ class ForgetPlugin(Star):
             
             logger.info(f"数据库已更新，删除后剩余消息数: {len(new_conversation_history)}")
             
-            # --- 5. 文本提取与清洗 (防风控/防RAG刷屏) ---
+            # --- 6. 文本提取与清洗 (适配单条User消息展示) ---
             def safe_extract_text(content_obj):
                 """从复杂结构中提取纯文本，过滤RAG/Memory等系统注入"""
                 text_buffer = ""
@@ -191,7 +211,6 @@ class ForgetPlugin(Star):
                         for item in content_obj:
                             if isinstance(item, dict) and item.get('type') == 'text':
                                 raw_text = item.get('text', '')
-                                # 核心过滤：如果包含RAG元数据，直接丢弃
                                 if not any(k in raw_text for k in ["<RAG", "Memory>", "history_knowledge"]):
                                     text_buffer += raw_text
                     elif isinstance(content_obj, str):
@@ -203,20 +222,29 @@ class ForgetPlugin(Star):
                 return text_buffer.strip()
 
             # 生成预览信息
-            deleted_info = f"🗑️ 已删除 {round_count} 轮对话:\n\n"
-            for i in range(0, len(deleted_messages), 2):
-                if i+1 >= len(deleted_messages): break
+            deleted_info = f"🗑️ 已删除 {rounds_found} 轮对话:\n\n"
+            
+            # 重新设计的展示逻辑，以适应不对称的 User/Assistant 数量
+            display_round = 1
+            for msg in deleted_messages:
+                role = msg.get('role')
+                text = safe_extract_text(msg.get('content', ''))
+                # 截断
+                show_text = text[:50].replace('\n', ' ') + ('...' if len(text)>50 else '')
                 
-                u_text = safe_extract_text(deleted_messages[i].get('content', ''))
-                a_text = safe_extract_text(deleted_messages[i+1].get('content', ''))
-                
-                # 截断预览（只显示前50个字）
-                u_show = u_text[:50].replace('\n', ' ') + ('...' if len(u_text)>50 else '')
-                a_show = a_text[:50].replace('\n', ' ') + ('...' if len(a_text)>50 else '')
-                
-                deleted_info += f"第 {i//2 + 1} 轮:\n"
-                deleted_info += f"👤: {u_show}\n"
-                deleted_info += f"🤖: {a_show}\n\n"
+                if role == 'user':
+                    deleted_info += f"第 {display_round} 轮:\n"
+                    deleted_info += f"👤: {show_text}\n"
+                    # 只有当这是 User 消息时，才增加轮次计数（用于视觉展示）
+                    # 逻辑上：如果后面紧跟 Assistant，它属于同一轮；如果后面又是 User，那就是新一轮
+                    display_round += 1
+                elif role == 'assistant':
+                    # 如果 Assistant 单独出现（不太可能，但在截断处可能），或者紧接 User
+                    deleted_info += f"🤖: {show_text}\n\n"
+            
+            # 修正末尾换行（如果最后一条是 User，上面循环不会加 \n\n）
+            if deleted_messages and deleted_messages[-1].get('role') == 'user':
+                deleted_info += "\n"
             
             yield event.plain_result(
                 f"{deleted_info}💡 在下一条消息发送前，发送 /cancel_forget 可以恢复这些对话"
